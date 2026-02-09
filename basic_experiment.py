@@ -1,19 +1,39 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from typing import Callable, Literal, Optional, Tuple, Dict, List
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import seaborn as sns
+# need imageio-ffmpeg for mp4
+import imageio.v2 as imageio
+from pandas.io.sas.sas_constants import subheader_pointer_length_x64
 
 
 # -----------------------------
 # Label generators (start simple)
 # -----------------------------
-def deterministic_step_label(x: np.ndarray, tau: float = 0.7) -> np.ndarray:
-    """y = 1[x >= tau]. Deterministic and fixed per experiment."""
-    return (x >= tau).astype(int)
+def deterministic_step_label(x: np.ndarray, label_threshold: float = 0.7) -> np.ndarray:
+    """y = 1[x >= label_threshold]. Deterministic and fixed per experiment."""
+    return (x >= label_threshold).astype(int)
 
+def deterministic_intervals_label(x: np.ndarray, label_threshold: list[tuple]) -> np.ndarray:
+    """y = 1[x in at least one interval]. Deterministic and fixed per experiment."""
+    y = np.zeros(shape=x.shape[0])
+    for interval in label_threshold:
+        mask = (x >= interval[0]) & (x <= interval[1])
+        y[mask] = 1
+    return (y).astype(int)
+
+def logistic_probability(x: np.ndarray, t: float = 0.7, k: float = 40.0) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-k * (x - t)))
+
+def probabilistic_step_label(x: np.ndarray, label_threshold: float = 0.7, k: float = 40.0, rng=None) -> np.ndarray:
+    rng = np.random.default_rng() if rng is None else rng
+    p = logistic_probability(x, t=label_threshold, k=k)
+    return rng.binomial(1, p).astype(int)
 
 # -----------------------------
 # Cost functions
@@ -23,21 +43,70 @@ def weight_l1_cost(weight: float | int):
         return weight * np.abs(x - xprime)
     return l1_cost
 
-
 # -----------------------------
 # Supplier hypothesis: reject-all OR right-threshold
 # -----------------------------
 supplier_colors = ["tab:blue", "tab:orange", "tab:brown", "tab:gray"]
+ActionKind = Literal["reject_all", "threshold", "interval"]
+DirectionRL = Literal["right", "left"]  # realized directions only
+
 @dataclass(frozen=True)
 class SupplierAction:
-    kind: Literal["reject_all", "right_threshold"]
-    threshold: Optional[float] = None  # only used if kind == "right_threshold"
+    kind: ActionKind
+
+    # threshold params
+    threshold: Optional[float] = None
+    direction: DirectionRL = "right"   # only used if kind == "threshold"
+
+    # interval params
+    lower: Optional[float] = None
+    upper: Optional[float] = None
 
     def accepts(self, xprime: np.ndarray) -> np.ndarray:
         if self.kind == "reject_all":
             return np.zeros_like(xprime, dtype=bool)
-        assert self.threshold is not None
-        return xprime >= self.threshold
+
+        if self.kind == "threshold":
+            assert self.threshold is not None
+            t = float(self.threshold)
+            if self.direction == "right":
+                return xprime >= t
+            else:  # "left"
+                return xprime <= t
+
+        if self.kind == "interval":
+            assert self.lower is not None and self.upper is not None
+            lo, hi = (self.lower, self.upper) if self.lower <= self.upper else (self.upper, self.lower)
+            return (xprime >= lo) & (xprime <= hi)
+
+        raise ValueError(f"Unknown kind: {self.kind}")
+
+    def best_xprime_l1(self, x0: np.ndarray) -> np.ndarray:
+        """Argmin_{x'} |x'-x0| s.t. accepts(x') == True, in 1D."""
+        if self.kind == "reject_all":
+            return x0  # infeasible; caller should handle
+
+        if self.kind == "threshold":
+            assert self.threshold is not None
+            t = float(self.threshold)
+            if self.direction == "right":
+                return np.where(x0 >= t, x0, t)
+            else:  # left
+                return np.where(x0 <= t, x0, t)
+
+        if self.kind == "interval":
+            assert self.lower is not None and self.upper is not None
+            lo, hi = (self.lower, self.upper) if self.lower <= self.upper else (self.upper, self.lower)
+            return np.clip(x0, lo, hi)
+
+        raise ValueError(f"Unknown kind: {self.kind}")
+
+ClassifierType = Literal["thr_right", "thr_left", "thr_multi", "interval"]
+
+@dataclass(frozen=True)
+class SupplierClassifierSpec:
+    ctype: ClassifierType
+
 
 @dataclass
 class RoundSnapshot:
@@ -91,10 +160,9 @@ def _best_response_to_actions(
     for j, a in enumerate(actions):
         if a.kind == "reject_all":
             continue
-        t = float(a.threshold)
         # candidate x': if x0 >= t stay, else move to t
         #todo: adapt for other classifiers
-        xprime_j = np.where(x0 >= t, x0, t)
+        xprime_j = a.best_xprime_l1(x0)
         xprime_candidates[:, j] = xprime_j
 
         accepted = a.accepts(xprime_j)  # should be True by construction unless numerical weirdness
@@ -121,9 +189,6 @@ def _best_response_to_actions(
             js = np.flatnonzero(np.isclose(utilities[i], best_u[i], atol=1e-12, rtol=0.0))
             chosen[i, js] = 1/len(js) # distribution
         return None, chosen
-
-
-
 
 # -----------------------------
 # Metrics
@@ -181,10 +246,12 @@ def compute_user_welfare(x0: np.ndarray, x_star: np.ndarray, chosen: np.ndarray,
 # Simulation: 2 suppliers, sequential best responses
 # -----------------------------
 @dataclass
-class BaselineConfig:
+class ExpConfig:
     n_users: int = 2000
     n_suppliers: int = 2
-    tau: float = 0.7
+    supplier_specs: List[SupplierClassifierSpec] = field(default_factory=list)
+    label_params: dict = field(default_factory=dict)
+    label_generator: Callable = deterministic_step_label
     v: float = 1.0
     alpha: float = 1.0
     beta: float = 1.0
@@ -198,7 +265,7 @@ def simulate_round(
     x0: np.ndarray,
     y: np.ndarray,
     actions: List[SupplierAction],
-    cfg: BaselineConfig,
+    cfg: ExpConfig,
     cost_fn: Callable[[np.ndarray, np.ndarray], np.ndarray],
     rng: np.random.Generator,
     store_snapshots: bool = False,
@@ -226,67 +293,179 @@ def simulate_round(
 
 def best_response_for_supplier(
     supplier_idx: int,
+    current_actions: list[SupplierAction],
+    supplier_spec: SupplierClassifierSpec,
     x0: np.ndarray,
     y: np.ndarray,
-    current_actions: List[SupplierAction],
-    cfg: BaselineConfig,
-    cost_fn: Callable[[np.ndarray, np.ndarray], np.ndarray],
-    rng: np.random.Generator,
-) -> SupplierAction:
-    """
-    Grid-search the supplier's best-response action holding other suppliers fixed.
-    Includes RejectAll as a special action (profit 0).
-    """
-    # Candidate thresholds
+    cfg,
+    cost_fn,
+    rng,
+):
     grid = np.linspace(0.0, 1.0, cfg.grid_size)
 
-    best_action = SupplierAction(kind="reject_all", threshold=None)
-    best_profit = 0.0  # reject-all baseline
+    best_action = SupplierAction(kind="reject_all")
+    best_profit = 0.0
 
-    # Try thresholds
-    for t in grid:
+    def eval_action(candidate: SupplierAction):
+        nonlocal best_action, best_profit
         actions_try = list(current_actions)
-        actions_try[supplier_idx] = SupplierAction(kind="right_threshold", threshold=float(t))
+        actions_try[supplier_idx] = candidate
 
-        x_star, chosen = simulate_round(x0, y, actions_try, cfg, cost_fn, rng, mode='prospective')
+        # prospective evaluation (as you already do)
+        _, chosen = simulate_round(x0, y, actions_try, cfg, cost_fn, rng, mode="prospective")
         prof = compute_expected_profit(y, chosen, supplier_idx, cfg.alpha, cfg.beta)
 
-        # Must not deploy negative profit (so reject-all beats any negative)
         if prof > best_profit + 1e-12:
             best_profit = prof
-            best_action = actions_try[supplier_idx]
+            best_action = candidate
+
+    ctype = supplier_spec.ctype
+
+    if ctype in ("thr_right", "thr_multi"):
+        for t in grid:
+            eval_action(SupplierAction(kind="threshold", threshold=float(t), direction="right"))
+
+    if ctype in ("thr_left", "thr_multi"):
+        for t in grid:
+            eval_action(SupplierAction(kind="threshold", threshold=float(t), direction="left"))
+
+    if ctype == "interval":
+        # O(G^2) intervals; OK for moderate grid_size
+        for lo in grid:
+            for hi in grid:
+                if hi < lo:
+                    continue
+                eval_action(SupplierAction(kind="interval", lower=float(lo), upper=float(hi)))
 
     return best_action
 
-def plot_thresholds(history):
-    rounds = range(len(history["threshold"][0]))
-    plt.figure(figsize=(8, 4))
-    for supplier in history["threshold"].keys():
-        plt.plot(rounds, history["threshold"][supplier], label=f"Supplier {supplier} threshold",
-                 color=supplier_colors[supplier])
-    # plt.plot(rounds, history["threshold"][1], label="Supplier 2 threshold")
-    plt.xlabel("Round")
-    plt.ylabel("Threshold")
-    plt.title("Classifier thresholds over rounds")
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
 
-def plot_profits(history, w_expectation=False):
+# def plot_thresholds(history):
+#     rounds = range(len(history["threshold"][0]))
+#     number_of_thresholds = len(history["threshold"][0][0])
+#     plt.figure(figsize=(8, 4))
+#     if number_of_thresholds - 1 == 1:
+#         for supplier in history["threshold"].keys():
+#             plt.plot(rounds, history["threshold"][supplier], label=f"Supplier {supplier} threshold",
+#                      color=supplier_colors[supplier])
+#     elif number_of_thresholds - 1 == 2:
+#         for supplier in history["threshold"].keys():
+#             lower_thresholds = [thresholds[0] for thresholds in history["threshold"][supplier]]
+#             upper_thresholds = [thresholds[1] for thresholds in history["threshold"][supplier]]
+#             plt.plot(rounds, lower_thresholds, linestyle='--', label=f"Supplier {supplier} threshold",
+#                      color=supplier_colors[supplier])
+#             plt.plot(rounds, upper_thresholds, linestyle=':', label=f"Supplier {supplier} threshold",
+#                      color=supplier_colors[supplier])
+#     # plt.plot(rounds, history["threshold"][1], label="Supplier 2 threshold")
+#     plt.xlabel("Round")
+#     plt.ylabel("Threshold")
+#     plt.title("Classifier thresholds over rounds")
+#     plt.legend()
+#     plt.grid(True)
+#     plt.tight_layout()
+#     plt.show()
+
+
+def _action_to_band(action, x_min=0.0, x_max=1.0):
+    """
+    Map a per-round classifier description into an accepted interval [lo, hi].
+    action is either:
+      (t, "right"), (t, "left"), or (lo, hi, "interval")
+    """
+    if action is None:
+        return (np.nan, np.nan)
+
+    # threshold + direction
+    if len(action) == 2:
+        t, direction = action
+        t = float(t)
+        if direction == "right":
+            return (t, x_max)
+        elif direction == "left":
+            return (x_min, t)
+        else:
+            raise ValueError(f"Unknown direction: {direction}")
+
+    # interval
+    if len(action) == 3:
+        lo, hi, kind = action
+        if kind != "interval":
+            raise ValueError(f"Unknown kind: {kind}")
+        lo, hi = float(lo), float(hi)
+        if hi < lo:
+            lo, hi = hi, lo
+        return (lo, hi)
+
+    raise ValueError(f"Unexpected action format: {action}")
+
+
+def plot_thresholds(history, save_dir=None, show_graphs=True, x_min=0.0, x_max=1.0, alpha=0.20):
+    """
+    For each supplier and each round, history["threshold"][supplier][r] is either:
+      (t, "right"), (t, "left"), or (lo, hi, "interval").
+
+    This plots + fills the accepted region [lo, hi] over rounds.
+    """
+    suppliers = list(history["threshold"].keys())
+    n_rounds = len(history["threshold"][suppliers[0]])
+    rounds = np.arange(n_rounds)
+
+    plt.figure(figsize=(10, 5))
+
+    for supplier in suppliers:
+        actions = history["threshold"][supplier]
+
+        lo = np.empty(n_rounds, dtype=float)
+        hi = np.empty(n_rounds, dtype=float)
+
+        for r, a in enumerate(actions):
+            lo[r], hi[r] = _action_to_band(a, x_min=x_min, x_max=x_max)
+
+        # Clip to [x_min, x_max] and mask invalid
+        lo = np.clip(lo, x_min, x_max)
+        hi = np.clip(hi, x_min, x_max)
+        valid = np.isfinite(lo) & np.isfinite(hi) & (hi >= lo)
+
+        # Fill accepted band (over rounds)
+        plt.fill_between(
+            rounds,
+            lo,
+            hi,
+            where=valid,
+            interpolate=True,
+            alpha=alpha,
+            color=supplier_colors[supplier],
+            label=f"Supplier {supplier} accepted region",
+        )
+
+        # Plot boundaries to make it readable
+        plt.plot(rounds[valid], lo[valid], color=supplier_colors[supplier], linewidth=1.5, linestyle="--")
+        plt.plot(rounds[valid], hi[valid], color=supplier_colors[supplier], linewidth=1.5, linestyle=":")
+
+    plt.xlabel("Round")
+    plt.ylabel("Accepted x-range")
+    plt.title("Classifier accepted regions over rounds")
+    plt.ylim(x_min, x_max)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    if save_dir is not None:
+        plt.savefig(os.path.join(save_dir, "thresholds.png"))
+    if show_graphs:
+        plt.show()
+
+
+def plot_profits(history, w_expectation=False, save_dir=None, show_graphs=True):
     rounds = range(len(history["profit"][0]))
     plt.figure(figsize=(8, 4))
     if w_expectation:
         for supplier in history["profit"].keys():
             plt.plot(rounds[:-1], history["profit"][supplier][:-1], label=f"Supplier {supplier} profit",
                      color=supplier_colors[supplier])
-        # plt.plot(rounds[:-1], history["profit"][0][:-1], label="Supplier 1 profit")
-        # plt.plot(rounds[:-1], history["profit"][1][:-1], label="Supplier 2 profit")
             plt.plot(rounds[-2], history["profit"][supplier][-1], linestyle=None,
                      label=f"Expected Supplier {supplier} profit", marker='x',
                      color=supplier_colors[supplier], alpha=0.5)
-        # plt.plot(rounds[-2], history["profit"][1][-1], linestyle=None,
-        #          label="Expected Supplier 2 profit", marker='x', color='tab:orange', alpha=0.5)
     else:
         for supplier in history["threshold"].keys():
             plt.plot(rounds, history["profit"][supplier], label=f"Supplier {supplier} profit",
@@ -297,9 +476,12 @@ def plot_profits(history, w_expectation=False):
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.show()
+    if save_dir is not None:
+        plt.savefig(os.path.join(save_dir, "profits.png"))
+    if show_graphs:
+        plt.show()
 
-def plot_market_share(history, w_expectation=True):
+def plot_market_share(history, w_expectation=False, save_dir=None, show_graphs=True):
     rounds = range(len(history["mshare"][0]))
     plt.figure(figsize=(8, 4))
     if w_expectation:
@@ -324,24 +506,29 @@ def plot_market_share(history, w_expectation=True):
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.show()
+    if save_dir is not None:
+        plt.savefig(os.path.join(save_dir, "market_shares.png"))
+    if show_graphs:
+        plt.show()
 
-def plot_accuracy(history):
+def plot_accuracy(history, save_dir=None, show_graphs=True):
     rounds = range(len(history["accuracy"][0]))
     plt.figure(figsize=(8, 4))
     for supplier in history["accuracy"].keys():
         plt.plot(rounds, history["accuracy"][supplier], label=f"Supplier {supplier} accuracy",
                  color=supplier_colors[supplier])
-    # plt.plot(rounds, history["acc2"], label="Supplier 2 accuracy")
     plt.xlabel("Round")
     plt.ylabel("Accuracy")
     plt.title("Classifier accuracy over rounds")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.show()
+    if save_dir is not None:
+        plt.savefig(os.path.join(save_dir, "accuracy.png"))
+    if show_graphs:
+        plt.show()
 
-def plot_user_metrics(history):
+def plot_user_metrics(history, save_dir=None, show_graphs=True):
     rounds = range(len(history["user_welfare"]))
     plt.figure(figsize=(8, 4))
     plt.plot(rounds, history["user_welfare"], label="User welfare", color='gold')
@@ -352,20 +539,19 @@ def plot_user_metrics(history):
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.show()
+    if save_dir is not None:
+        plt.savefig(os.path.join(save_dir, "user_metrics.png"))
+    if show_graphs:
+        plt.show()
 
-def plot_baseline_dashboard(history, w_expectation=False):
-    plot_thresholds(history)
-    plot_profits(history, w_expectation)
-    plot_market_share(history, w_expectation)
-    plot_accuracy(history)
-    plot_user_metrics(history)
+def plot_baseline_dashboard(history, w_expectation: bool=False, save_dir: None | str=None, show_graphs: bool=True):
+    plot_thresholds(history, save_dir, show_graphs)
+    plot_profits(history, w_expectation, save_dir, show_graphs)
+    plot_market_share(history, w_expectation, save_dir, show_graphs)
+    plot_accuracy(history, save_dir, show_graphs)
+    plot_user_metrics(history, save_dir, show_graphs)
 
-
-import numpy as np
-import matplotlib.pyplot as plt
-
-def make_snapshot_figure(snapshot, title_extra: str = ""):
+def make_snapshot_figure(snapshot, title_extra: str = "", x_min: float = 0.0, x_max: float = 1.0):
     x0 = snapshot.x0
     y = snapshot.y
     x_star = snapshot.x_star
@@ -375,48 +561,101 @@ def make_snapshot_figure(snapshot, title_extra: str = ""):
 
     fig, ax = plt.subplots(figsize=(10, 3.2))
 
-    # original points at y=0
-    ax.scatter(x0[y == 0], np.zeros(np.sum(y == 0)), s=10, alpha=0.6, label="y=0 (orig)", color='tab:red')
-    ax.scatter(x0[y == 1], np.zeros(np.sum(y == 1)), s=10, alpha=0.6, label="y=1 (orig)", color='tab:green')
-
-    # movement arrows/segments
-    moved = chosen != -1
-    idxs = np.where(moved)[0]
-    for i in idxs:
-        ax.plot([x0[i], x_star[i]], [0.0, 0.25], linewidth=0.5, alpha=0.25)
-
-    # final positions by chosen supplier
-    chosen_colors = supplier_colors
-    for j in range(len(actions)):
-        mask = chosen == j
-        if np.any(mask):
-            ax.scatter(x_star[mask], np.full(np.sum(mask), 0.25), s=14, alpha=0.8, label=f"chosen {j+1}",
-                       color=chosen_colors[j])
-
-    # opt-out
-    out = chosen == -1
-    if np.any(out):
-        ax.scatter(x0[out], np.full(np.sum(out), -0.05), s=10, alpha=0.6, label="opt-out", color='tab:purple')
-
-    # classifier thresholds
-    for j, a in enumerate(actions):
-        if a.kind == "right_threshold":
-            ax.axvline(a.threshold, linestyle="--", alpha=0.9, color=chosen_colors[j])
-            ax.text(a.threshold, 0.45, f"S{j+1}: {a.threshold:.2f}", rotation=90, va="bottom")
-        else:
-            ax.text(0.02 + 0.22*j, 0.45, f"S{j+1}: RejectAll", va="bottom")
+    # --- y-levels for visual layout ---
+    y_orig = 0.00
+    y_final = 0.15
+    y_out = -0.05
 
     ax.set_ylim(-0.15, 0.55)
     ax.set_yticks([])
+    ax.set_xlim(x_min, x_max)
     ax.set_xlabel("x")
     ax.set_title(f"Round {r} {title_extra}".strip())
+
+    # --- 1) Fill accepted regions + draw boundary lines (DO THIS FIRST so points appear on top) ---
+    xgrid = np.linspace(x_min, x_max, 400)
+    y_bottom, y_top = -0.12, 0.52  # vertical span of the shaded acceptance band
+
+    for j, a in enumerate(actions):
+        col = supplier_colors[j]
+
+        if a.kind == "reject_all":
+            ax.text(0.02 + 0.22 * j, 0.35, f"S{j+1}: RejectAll", va="bottom")
+            continue
+
+        # accepted mask over xgrid
+        accepted_mask = a.accepts(xgrid)
+
+        # Fill the vertical band where accepted
+        ax.fill_between(
+            xgrid,
+            y_bottom,
+            y_top,
+            where=accepted_mask,
+            interpolate=True,
+            alpha=0.10,          # increase if you want more visible shading
+            color=col,
+            zorder=0,
+        )
+
+        # Draw demarcation lines + annotate
+        if a.kind == "threshold":
+            t = float(a.threshold)
+            ax.axvline(t, linestyle="--", linewidth=2.0, alpha=0.95, color=col, zorder=3)
+            ax.text(
+                t, 0.25 + j * 0.1,
+                f"S{j+1}: {a.direction} @ {t:.2f}",
+                va="bottom", ha="center", color=col
+            )
+
+        elif a.kind == "interval":
+            lo = float(a.lower)
+            hi = float(a.upper)
+            if hi < lo:
+                lo, hi = hi, lo
+
+            ax.axvline(lo, linestyle="--", linewidth=2.0, alpha=0.95, color=col, zorder=3)
+            ax.axvline(hi, linestyle="--",  linewidth=2.0, alpha=0.95, color=col, zorder=3)
+            ax.text(
+                (lo + hi) / 2, 0.25 + j * 0.1,
+                f"S{j+1}: [{lo:.2f}, {hi:.2f}]",
+                va="bottom", ha="center", color=col
+            )
+
+        else:
+            # In case you add new kinds later
+            ax.text(0.02 + 0.22 * j, 0.25 + j * 0.1, f"S{j+1}: {a.kind}", va="bottom", color=col)
+
+    # --- 2) Original points at y=0 ---
+    ax.scatter(x0[y == 0], np.full(np.sum(y == 0), y_orig), s=10, alpha=0.6,
+               label="y=0 (orig)", color='tab:red', zorder=4)
+    ax.scatter(x0[y == 1], np.full(np.sum(y == 1), y_orig), s=10, alpha=0.6,
+               label="y=1 (orig)", color='tab:green', zorder=4)
+
+    # --- 3) Movement arrows/segments ---
+    moved = chosen != -1
+    idxs = np.where(moved)[0]
+    for i in idxs:
+        ax.plot([x0[i], x_star[i]], [y_orig, y_final],
+                linewidth=0.8, alpha=0.25, color="k", zorder=2)
+
+    # --- 4) Final positions by chosen supplier ---
+    for j in range(len(actions)):
+        mask = chosen == j
+        if np.any(mask):
+            ax.scatter(x_star[mask], np.full(np.sum(mask), y_final),
+                       s=14, alpha=0.85, label=f"chosen {j+1}",
+                       color=supplier_colors[j], zorder=5)
+
+    # --- 5) Opt-out ---
+    out = chosen == -1
+    if np.any(out):
+        ax.scatter(x0[out], np.full(np.sum(out), y_out), s=10, alpha=0.6,
+                   label="opt-out", color='tab:purple', zorder=4)
+
     ax.legend(loc="upper center", ncol=4, frameon=False)
     fig.tight_layout()
-
     return fig
-
-
-from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 
 def fig_to_rgb_array(fig):
     canvas = FigureCanvas(fig)
@@ -425,21 +664,7 @@ def fig_to_rgb_array(fig):
     buf = np.frombuffer(canvas.tostring_rgb(), dtype=np.uint8)
     return buf.reshape(h, w, 3)
 
-import io
-import imageio.v2 as imageio
-
-def snapshots_to_gif(snapshots, gif_path="market_sim.gif", fps=2):
-    frames = []
-    for snap in snapshots:
-        fig = make_snapshot_figure(snap)
-        frame = fig_to_rgb_array(fig)
-        plt.close(fig)
-        frames.append(frame)
-    imageio.mimsave(gif_path, frames, fps=fps)
-    return gif_path
-
-
-def snapshots_to_mp4(snapshots, mp4_path="market_sim.mp4", fps=6):
+def snapshots_to_mp4(snapshots, mp4_path="market_dynamics.mp4", fps=6):
     with imageio.get_writer(mp4_path, fps=fps) as writer:
         for snap in snapshots:
             fig = make_snapshot_figure(snap)
@@ -448,14 +673,13 @@ def snapshots_to_mp4(snapshots, mp4_path="market_sim.mp4", fps=6):
             writer.append_data(frame)
     return mp4_path
 
-
-
 def run_baseline_experiment(
-    cfg: BaselineConfig,
+    cfg: ExpConfig,
     cost_fn: Callable[[np.ndarray, np.ndarray], np.ndarray] = weight_l1_cost(1.0),
     max_rounds_after_convergence: int = 0,
     store_snapshots: bool = True,
-    add_expected_metrics: bool = False
+    add_next_expected_metrics: bool = False,
+    save_dir: str | None = None
 ):
     rounds_after_convergence = 0
     rng = np.random.default_rng(cfg.seed)
@@ -463,11 +687,16 @@ def run_baseline_experiment(
 
     # Sample users and labels
     x0 = rng.uniform(0.0, 1.0, size=cfg.n_users)
-    y = deterministic_step_label(x0, tau=cfg.tau)
+    y = cfg.label_generator(x0, **cfg.label_params)
 
-    # sns.scatterplot(x=x0, y=y, hue=y)
-    # plt.title("Users at time=0")
-    # plt.show()
+    if save_dir is not None:
+        fig, ax = plt.subplots(ncols=2, figsize=(8, 4))
+        sns.histplot(x=x0, hue=y, hue_order=[1,0], palette=['tab:green', 'tab:red'], bins=20, ax=ax[1])
+        sns.scatterplot(x=x0, y=y, hue=y, hue_order=[1,0], palette=['tab:green', 'tab:red'], alpha=0.7, s=10, ax=ax[0])
+        ax[0].set_xlim((0, 1))
+        ax[1].set_xlim((0, 1))
+        plt.suptitle("Y Distribution")
+        plt.savefig(os.path.join(save_dir, 'y_distribution.png'))
 
     # Initialize actions (simple start)
     actions = [SupplierAction(kind='reject_all') for i in range(cfg.n_suppliers)]
@@ -481,10 +710,13 @@ def run_baseline_experiment(
     history["social_burden"] = []
     history["user_welfare"] = []
 
-    def _t(action: SupplierAction) -> float:
+    def get_classifier_rule(action: SupplierAction) -> float | tuple:
         if action.kind == "reject_all":
             return float("nan")
-        return float(action.threshold)
+        elif action.kind == "threshold":
+            return (float(action.threshold), action.direction)
+        elif action.kind == "interval":
+            return (float(action.lower), float(action.upper), action.kind)
 
     prev_actions = None
 
@@ -493,6 +725,7 @@ def run_baseline_experiment(
         for j in range(cfg.n_suppliers):
             actions[j] = best_response_for_supplier(
                 supplier_idx=j,
+                supplier_spec=cfg.supplier_specs[j],
                 x0=x0,
                 y=y,
                 current_actions=actions,
@@ -511,7 +744,7 @@ def run_baseline_experiment(
         uw = compute_user_welfare(x0, x_star, chosen, cfg.v, cost_fn)
 
         for i in range(cfg.n_suppliers):
-            history["threshold"][i].append(_t(actions[i]))
+            history["threshold"][i].append(get_classifier_rule(actions[i]))
             history["profit"][i].append(compute_profit(y, chosen, i, cfg.alpha, cfg.beta))
             history["accuracy"][i].append(compute_accuracy(y, x_star, actions[i]))
             history["mshare"][i].append(compute_market_share_true_positives(y, chosen, i))
@@ -524,7 +757,7 @@ def run_baseline_experiment(
             if rounds_after_convergence >= max_rounds_after_convergence:
                 break
         prev_actions = list(actions)
-    if add_expected_metrics:
+    if add_next_expected_metrics:
         _, chosen = simulate_round(x0, y, actions, cfg, cost_fn, rng, mode='prospective')
         for i in range(cfg.n_suppliers):
             history["profit"][i].append(compute_expected_profit(y, chosen, i, cfg.alpha, cfg.beta))
@@ -535,25 +768,73 @@ def run_baseline_experiment(
 # -----------------------------
 # Example usage
 # -----------------------------
-if __name__ == "__main__":
-    cfg = BaselineConfig(
-        n_users=100,
+saved_configs = {'simplest_experiment': # two suppliers, y = I[x >= 0.7], models = I[x>=t] -> shows our basic hypothesis
+    ExpConfig(
+        n_users=50,
         n_suppliers=2,
-        tau=0.7,
+        supplier_specs=[SupplierClassifierSpec("thr_right"), SupplierClassifierSpec("thr_right")],
+        label_params={'label_threshold': 0.7},
+        label_generator=deterministic_step_label,
         alpha=1.0,
         beta=1.0,
         grid_size=101,
         max_rounds=10,
         seed=42,
+    ), 'deterministic_intervals_experiment': # two suppliers, y = I[x >= 0.7], models = I[t1>x>=t2] -> shows competition "improving" model for consumer.
+                                    # Note that this is an artifact of how the best threshold is chosen
+    ExpConfig(
+        n_users=50,
+        n_suppliers=2,
+        supplier_specs=[SupplierClassifierSpec("interval"), SupplierClassifierSpec("interval")],
+        label_params={'label_threshold': 0.7},
+        label_generator=deterministic_step_label,
+        alpha=1.0,
+        beta=1.0,
+        grid_size=101,
+        max_rounds=10,
+        seed=42,
+    ), 'deterministic_two_market_experiment': # two suppliers, y = I[x >= 0.7], models = I[x>t] or I[x<t] -> converge to different markets.
+    ExpConfig(
+        n_users=50,
+        n_suppliers=2,
+        supplier_specs=[SupplierClassifierSpec("thr_multi"), SupplierClassifierSpec("thr_multi")],
+        label_params={'label_threshold': [(0, 0.3), (0.7, 1.0)]},
+        label_generator=deterministic_intervals_label,
+        alpha=1.0,
+        beta=1.0,
+        grid_size=101,
+        max_rounds=10,
+        seed=42,
+    ), 'probabilistic_interval_experiment': # Need to further explore, is the negative profit due to randomness or a problem in the policy
+    ExpConfig(
+        n_users=50,
+        n_suppliers=2,
+        supplier_specs=[SupplierClassifierSpec("interval"), SupplierClassifierSpec("interval")],
+        label_params={'label_threshold': 0.5, 'k': 1, 'rng': np.random.default_rng(5)},
+        label_generator=probabilistic_step_label,
+        alpha=1.0,
+        beta=1.0,
+        grid_size=101,
+        max_rounds=15,
+        seed=42,
     )
-    add_expected_metrics = True
+
+}
+if __name__ == "__main__":
+    experiment_name = 'probabilistic_interval_experiment'
+    cfg = saved_configs[experiment_name]
+    save_dir = './' + experiment_name # or None if you don't want to save
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+    show_graphs = False
+    add_next_expected_metrics = True
     max_rounds_after_convergence = 5
     hist, snaps = run_baseline_experiment(cfg, weight_l1_cost(10),
                                           max_rounds_after_convergence=max_rounds_after_convergence,
-                                        add_expected_metrics=add_expected_metrics)
+                                        add_next_expected_metrics=add_next_expected_metrics, save_dir=save_dir)
     print("Rounds:", len(hist["threshold"][0]))
     print("Final thresholds:", *[hist["threshold"][i][-1] for i in range(cfg.n_suppliers)])
-    if add_expected_metrics:
+    if add_next_expected_metrics:
         print("Final expected profits:", *[hist["profit"][i][-1] for i in range(cfg.n_suppliers)])
         print("Final actual profits:", *[hist["profit"][i][-2] for i in range(cfg.n_suppliers)])
         print("Final expected mshares:", *[hist["mshare"][i][-1] for i in range(cfg.n_suppliers)])
@@ -563,7 +844,7 @@ if __name__ == "__main__":
         print("Final mshares:", *[hist["mshare"][i][-1] for i in range(cfg.n_suppliers)])
     print("Final social burden (TP):", hist["social_burden"][-1])
 
-    plot_baseline_dashboard(hist, w_expectation=add_expected_metrics)
-    # gif_path = snapshots_to_gif(snaps, "baseline.gif", fps=2)
-    gif_path = snapshots_to_mp4(snaps, "baseline.mp4", fps=6)
+
+    plot_baseline_dashboard(hist, w_expectation=add_next_expected_metrics, save_dir=save_dir, show_graphs=show_graphs)
+    mp4_path = snapshots_to_mp4(snaps, os.path.join(save_dir, f"market_dynamics.mp4"), fps=6)
 
