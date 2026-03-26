@@ -9,7 +9,6 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import seaborn as sns
 # need imageio-ffmpeg for mp4
 import imageio.v2 as imageio
-from pandas.io.sas.sas_constants import subheader_pointer_length_x64
 
 
 # -----------------------------
